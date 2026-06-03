@@ -160,6 +160,16 @@ def test_implausibly_small_amount_is_discarded():
     assert m.authorization_amount is None
 
 
+def test_execution_pace_language_is_not_expansion():
+    text = (
+        "We intend to increase our stock repurchase levels in the third quarter "
+        "relative to the second quarter under our share repurchase program."
+    )
+    m = _by_token(find_buyback_matches(text), "share repurchase program")
+    assert m.event_type == EVENT_REFERENCE
+    assert m.has_expansion_language is False
+
+
 def test_identical_authorization_repeated_in_doc_is_deduped():
     text = (
         "On March 11, 2025, the board authorized a $9 billion share "

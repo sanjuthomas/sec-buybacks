@@ -78,6 +78,14 @@ _EXPANSION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Quarterly MD&A often says the firm will "increase/moderate stock repurchase
+# levels" -- that is execution pace, not a new authorization amount.
+_EXECUTION_PACE_RE = re.compile(
+    r"\b(?:increase|moderate|reduce\w*|decrease\w*)\s+(?:\w+\s+){0,4}?"
+    r"(?:stock\s+)?repurchase\s+levels\b",
+    re.IGNORECASE,
+)
+
 # How close (in characters) an authorizing verb must be to the matched phrase
 # to count as authorizing *that* program.
 _AUTH_PROXIMITY = 90
@@ -125,6 +133,8 @@ _REFERENCE_SIGNALS: dict[str, int] = {
     "current": 1,
     "maintains": 1,
     "as of": 1,
+    "repurchase levels": 3,
+    "relative to the": 2,
 }
 _REFERENCE_THRESHOLD = 2
 
@@ -393,7 +403,10 @@ def _build_match(
             amount, amount_text = None, None
         anchor = auth_verb.start() if auth_verb else local_start
         authorization_date = _nearest_date(raw_context, anchor)
-        has_expansion = _EXPANSION_RE.search(raw_context) is not None
+        has_expansion = (
+            _EXPANSION_RE.search(raw_context) is not None
+            and _EXECUTION_PACE_RE.search(raw_context) is None
+        )
 
     return Match(
         matched_token=token,

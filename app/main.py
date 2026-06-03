@@ -8,6 +8,7 @@ Run with::
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from datetime import date
 
@@ -31,6 +32,20 @@ from app.models import BuybackAnnouncement, BuybackResponse, Filing
 # filing is merely restating a previously announced program. ~one fiscal
 # quarter plus filing lag.
 _CONTEMPORANEOUS_DAYS = 135
+
+_SINCE_DATE_RE = re.compile(
+    r"\bsince\s+(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+_SINCE_MONTH_INDEX = {
+    name.lower(): i
+    for i, name in enumerate(
+        "January February March April May June July August September October "
+        "November December".split(),
+        start=1,
+    )
+}
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -111,12 +126,31 @@ async def _scan_filing(
     return [ann for group in scanned for ann in group]
 
 
+def _restates_historical_program(context: str, filing_date: date) -> bool:
+    """True when the snippet refers to a program authorized long ago."""
+
+    for m in _SINCE_DATE_RE.finditer(context):
+        month_name = m.group(1).lower()
+        year = int(m.group(2))
+        month = _SINCE_MONTH_INDEX.get(month_name)
+        if month is None:
+            continue
+        try:
+            since_date = date(year, month, 1)
+        except ValueError:
+            continue
+        if (filing_date - since_date).days > _CONTEMPORANEOUS_DAYS:
+            return True
+    return False
+
+
 def _refine_event_type(filing: Filing, match) -> str:
     """Confirm or downgrade an extractor 'new authorization' using the filing.
 
     8-Ks are the vehicle for announcing buybacks, so an authorization detected
-    there is accepted. Periodic reports (10-K/10-Q) routinely re-describe an
-    existing program, so for those we require:
+    there is accepted when it carries a parsed dollar figure. Periodic reports
+    (10-K/10-Q) routinely re-describe an existing program, so for those we
+    require:
 
     1. a concrete authorization amount (filters boilerplate such as "we have
        adopted a share repurchase program" that carries no dollar figure); and
@@ -131,8 +165,17 @@ def _refine_event_type(filing: Filing, match) -> str:
 
     if match.event_type != EVENT_NEW_AUTHORIZATION:
         return EVENT_REFERENCE
+
+    context_lower = match.amount_context.lower()
+    if "repurchase levels" in context_lower:
+        return EVENT_REFERENCE
+    if _restates_historical_program(match.amount_context, filing.filing_date):
+        return EVENT_REFERENCE
+
     if filing.form.upper() == "8-K":
-        return EVENT_NEW_AUTHORIZATION
+        if match.authorization_amount is not None:
+            return EVENT_NEW_AUTHORIZATION
+        return EVENT_REFERENCE
     if match.authorization_amount is None:
         return EVENT_REFERENCE
     if match.has_expansion_language:
@@ -177,8 +220,9 @@ def _dedupe_authorizations(
     1. within a filing, down to a single announcement -- a filing announces a
        given program once, so we keep the hit with the largest (most complete)
        parsed amount; then
-    2. across filings, by (amount, announcement-date) -- so a program restated
-       in later filings counts once, keeping the earliest (original) filing.
+    2. across filings, by authorization amount -- the same dollar authorization
+       re-described in later 10-Q/10-K filings counts once, keeping the
+       earliest filing (the original announcement in the window).
     """
 
     def _amount_key(ann: BuybackAnnouncement) -> float | None:
@@ -198,10 +242,16 @@ def _dedupe_authorizations(
         if current is None or _amount_rank(ann) > _amount_rank(current):
             per_filing[filing_key] = ann
 
-    seen: dict[tuple, BuybackAnnouncement] = {}
+    by_amount: dict[float, BuybackAnnouncement] = {}
+    without_amount: dict[str, BuybackAnnouncement] = {}
     for ann in sorted(per_filing.values(), key=lambda a: a.filing_date):
-        seen.setdefault((_amount_key(ann), ann.announcement_date), ann)
-    return list(seen.values())
+        amount_key = _amount_key(ann)
+        if amount_key is not None:
+            by_amount.setdefault(amount_key, ann)
+        else:
+            filing_key = ann.filing_url.rsplit("/", 1)[0]
+            without_amount.setdefault(filing_key, ann)
+    return list(by_amount.values()) + list(without_amount.values())
 
 
 def _dedupe_references(

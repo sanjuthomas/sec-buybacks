@@ -71,12 +71,13 @@ def test_extractor_reference_stays_reference():
     )
 
 
-def test_8k_authorization_always_accepted():
+def test_8k_authorization_requires_amount():
     filing = _filing("8-K", date(2025, 5, 1), date(2025, 5, 1))
     assert (
-        _refine_event_type(filing, _match(amount=None))
+        _refine_event_type(filing, _match(amount=5_000_000_000.0))
         == EVENT_NEW_AUTHORIZATION
     )
+    assert _refine_event_type(filing, _match(amount=None)) == EVENT_REFERENCE
 
 
 def test_periodic_report_without_amount_is_reference():
@@ -167,3 +168,54 @@ def test_dedupe_collapses_same_filing_different_parsed_dates():
         ),
     ]
     assert len(_dedupe_authorizations(anns)) == 1
+
+
+def test_dedupe_collapses_same_amount_across_filings():
+    # The same $30B program re-described in successive 10-Q filings should
+    # count once, keeping the earliest filing in the window.
+    anns = [
+        _announcement(
+            filing_url="https://sec.gov/Archives/edgar/data/1/000111/a.htm",
+            amount=30_000_000_000.0,
+            announcement_date=date(2023, 2, 24),
+            filing_date=date(2023, 2, 24),
+        ),
+        _announcement(
+            filing_url="https://sec.gov/Archives/edgar/data/1/000222/b.htm",
+            amount=30_000_000_000.0,
+            announcement_date=date(2023, 5, 4),
+            filing_date=date(2023, 5, 4),
+        ),
+        _announcement(
+            filing_url="https://sec.gov/Archives/edgar/data/1/000333/c.htm",
+            amount=30_000_000_000.0,
+            announcement_date=date(2023, 8, 3),
+            filing_date=date(2023, 8, 3),
+        ),
+    ]
+    result = _dedupe_authorizations(anns)
+    assert len(result) == 1
+    assert result[0].filing_date == date(2023, 2, 24)
+
+
+def test_periodic_report_execution_levels_is_reference():
+    filing = _filing("10-Q", date(2023, 8, 3), date(2023, 6, 30))
+    match = _match(
+        amount=30_000_000_000.0,
+        expansion=True,
+    )
+    match.amount_context = (
+        "We intend to increase our stock repurchase levels in the third quarter "
+        "relative to the second quarter under our share repurchase program."
+    )
+    assert _refine_event_type(filing, match) == EVENT_REFERENCE
+
+
+def test_periodic_report_historical_since_is_reference():
+    filing = _filing("10-K", date(2023, 2, 24), date(2022, 12, 31))
+    match = _match(amount=30_000_000_000.0, expansion=True)
+    match.amount_context = (
+        "Since March 2000, our Board had approved a repurchase program "
+        "authorizing repurchases of up to $30 billion of common stock."
+    )
+    assert _refine_event_type(filing, match) == EVENT_REFERENCE
