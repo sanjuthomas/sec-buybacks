@@ -64,8 +64,13 @@ to avoid being throttled or blocked by the SEC.
 
 Ticker → CIK lookups are cached in MongoDB so the SEC ticker map isn't fetched
 from EDGAR on every request. On a cache miss the service fetches the map from
-EDGAR, stores it, and serves subsequent lookups from Mongo. If Mongo is
-unreachable the service degrades gracefully and falls back to EDGAR directly.
+EDGAR, stores it, and serves subsequent lookups from Mongo.
+
+Each narrative filing document is cached permanently by its SEC archives URL
+once scanned (including documents with no buyback matches), so the same HTML
+is never downloaded twice. New or amended filings use new URLs and are scanned
+once. If Mongo is unreachable the service degrades gracefully and falls back to
+EDGAR directly.
 
 Defaults point at a local instance; override via environment variables:
 
@@ -73,6 +78,7 @@ Defaults point at a local instance; override via environment variables:
 export MONGO_URI="mongodb://localhost:27017"   # add credentials here if needed
 export MONGO_DB="sec_buybacks"
 export MONGO_TICKERS_COLLECTION="tickers"
+export MONGO_FILINGS_COLLECTION="filings"
 ```
 
 ## Run

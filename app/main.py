@@ -21,6 +21,7 @@ from app.analysis.extractor import (
     html_to_text,
 )
 from app.config import settings
+from app.db.document_store import document_store
 from app.db.ticker_store import ticker_store
 from app.edgar.client import EdgarClient, EdgarError
 from app.edgar.filings import fetch_filing_document_urls, fetch_recent_filings
@@ -50,8 +51,9 @@ _SINCE_MONTH_INDEX = {
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     yield
-    # Release the Mongo connection pool on shutdown.
+    # Release the Mongo connection pools on shutdown.
     ticker_store.close()
+    document_store.close()
 
 
 app = FastAPI(
@@ -71,9 +73,23 @@ async def health() -> dict[str, str]:
 
 
 async def _scan_document(
-    client: EdgarClient, filing: Filing, document_url: str
+    client: EdgarClient,
+    filing: Filing,
+    document_url: str,
+    *,
+    ticker: str,
+    cik: str,
 ) -> list[BuybackAnnouncement]:
-    """Download one document and extract buyback announcements from it."""
+    """Download one document and extract buyback announcements from it.
+
+    Results are served from Mongo when this document URL was scanned before;
+    otherwise the filing is downloaded, parsed, and cached (including empty
+    results). Transient download failures are not cached.
+    """
+
+    cached = await document_store.get(document_url)
+    if cached is not None:
+        return cached
 
     try:
         content = await client.get_text(document_url)
@@ -106,11 +122,14 @@ async def _scan_document(
                 filing_url=document_url,
             )
         )
+    await document_store.put(
+        document_url, announcements, ticker=ticker, cik=cik
+    )
     return announcements
 
 
 async def _scan_filing(
-    client: EdgarClient, filing: Filing
+    client: EdgarClient, filing: Filing, *, ticker: str, cik: str
 ) -> list[BuybackAnnouncement]:
     """Scan every narrative document in a filing and extract announcements.
 
@@ -121,7 +140,10 @@ async def _scan_filing(
 
     document_urls = await fetch_filing_document_urls(client, filing)
     scanned = await asyncio.gather(
-        *(_scan_document(client, filing, url) for url in document_urls)
+        *(
+            _scan_document(client, filing, url, ticker=ticker, cik=cik)
+            for url in document_urls
+        )
     )
     return [ann for group in scanned for ann in group]
 
@@ -310,8 +332,14 @@ async def get_buybacks(
         except EdgarError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        normalized_ticker = ticker.upper()
         scanned = await asyncio.gather(
-            *(_scan_filing(client, filing) for filing in filings)
+            *(
+                _scan_filing(
+                    client, filing, ticker=normalized_ticker, cik=cik
+                )
+                for filing in filings
+            )
         )
 
     all_matches = [a for group in scanned for a in group]

@@ -84,6 +84,11 @@ class Settings:
             "MONGO_TICKERS_COLLECTION", "tickers"
         )
     )
+    mongo_filings_collection: str = field(
+        default_factory=lambda: os.environ.get(
+            "MONGO_FILINGS_COLLECTION", "filings"
+        )
+    )
     # How long to wait for the Mongo server before giving up and falling back to
     # a direct EDGAR call (milliseconds).
     mongo_timeout_ms: int = field(
