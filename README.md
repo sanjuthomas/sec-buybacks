@@ -38,8 +38,8 @@ Class-share tickers can be written with either a dot or a dash
 ## Requirements
 
 - Python 3.11+ (developed against 3.13)
-- MongoDB (used to cache ticker → CIK lookups). A local instance on the default
-  port with no authentication works out of the box.
+- MongoDB (caches ticker → CIK lookups and scanned filing documents). A local
+  instance on the default port with no authentication works out of the box.
 
 ## Setup
 
@@ -62,15 +62,9 @@ to avoid being throttled or blocked by the SEC.
 
 ### MongoDB
 
-Ticker → CIK lookups are cached in MongoDB so the SEC ticker map isn't fetched
-from EDGAR on every request. On a cache miss the service fetches the map from
-EDGAR, stores it, and serves subsequent lookups from Mongo.
-
-Each narrative filing document is cached permanently by its SEC archives URL
-once scanned (including documents with no buyback matches), so the same HTML
-is never downloaded twice. New or amended filings use new URLs and are scanned
-once. If Mongo is unreachable the service degrades gracefully and falls back to
-EDGAR directly.
+The service uses two collections in the same database. If MongoDB is
+unreachable, reads are skipped and writes are no-ops; the API still works by
+calling EDGAR directly (just without the cache speed-up).
 
 Defaults point at a local instance; override via environment variables:
 
@@ -80,6 +74,112 @@ export MONGO_DB="sec_buybacks"
 export MONGO_TICKERS_COLLECTION="tickers"
 export MONGO_FILINGS_COLLECTION="filings"
 ```
+
+#### `tickers` collection — ticker → CIK
+
+Used once per API request to resolve the symbol before any filing work.
+
+| Field | Description |
+|-------|-------------|
+| `_id` | Upper-case ticker (SEC dash form for class shares, e.g. `BRK-B`) |
+| `cik` | Zero-padded 10-digit CIK |
+| `company_name` | Issuer name from the SEC ticker map |
+
+- **Cache hit:** ticker is found in Mongo → no `company_tickers.json` download.
+- **Cache miss:** fetch the full SEC ticker map from EDGAR, upsert all rows into
+  `tickers`, then resolve the requested symbol.
+- **Not cached:** unknown tickers (404); the map is not re-fetched on every
+  request once populated.
+
+#### `filings` collection — scanned EDGAR documents
+
+Each row is one **narrative document** (primary filing HTML or an exhibit), not
+an entire SEC submission. The document’s SEC archives URL is the primary key.
+Filings are treated as immutable; corrections arrive as new filings with new
+URLs, so scan results are stored indefinitely.
+
+| Field | Description |
+|-------|-------------|
+| `_id` | Full document URL (e.g. `https://www.sec.gov/Archives/edgar/data/.../ex99.htm`) |
+| `ticker` | Request ticker (upper-case), indexed |
+| `cik` | Company CIK for that scan, indexed |
+| `announcements` | Extracted `BuybackAnnouncement` objects (may be `[]`) |
+| `processed_at` | UTC timestamp when the document was last scanned |
+
+Indexes: `ticker`, `cik` (created automatically on first read/write).
+
+- **Cache hit:** document URL exists in `filings` → return stored
+  `announcements`; **no** HTML download from EDGAR.
+- **Cache miss:** download the document, run phrase extraction and
+  classification, then upsert into `filings` (including empty results).
+- **Not cached:** transient download errors (network, HTTP errors) — the next
+  request will retry EDGAR.
+- **Always from EDGAR (even when Mongo is warm):**
+  - `submissions/CIK{n}.json` (and paginated history files when `lookback_days`
+    reaches beyond the inline “recent” table) — to discover filings in the
+    date window and detect **new** submissions since the last visit.
+  - `index.json` per filing directory — to list narrative documents (primary +
+    exhibits) to scan.
+
+So repeat requests for the same ticker are fast mainly because **document HTML
+is not re-fetched**; listing filings from EDGAR is still done to pick up new
+8-Ks / 10-Qs.
+
+### Data flow
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant API as FastAPI
+    participant Tickers as Mongo tickers
+    participant Filings as Mongo filings
+    participant EDGAR as SEC EDGAR
+
+    Browser->>API: GET /api/buybacks/{ticker}
+
+    API->>Tickers: find ticker
+    alt ticker cache hit
+        Tickers-->>API: cik, company_name
+    else ticker cache miss
+        API->>EDGAR: company_tickers.json
+        EDGAR-->>API: full ticker map
+        API->>Tickers: upsert map
+        Tickers-->>API: cik, company_name
+    end
+
+    API->>EDGAR: submissions JSON (+ history files if needed)
+    EDGAR-->>API: filings in lookback window
+
+    loop each filing in window
+        API->>EDGAR: filing directory index.json
+        EDGAR-->>API: document URLs to scan
+
+        loop each narrative document URL
+            API->>Filings: find by document URL (_id)
+            alt filings cache hit
+                Filings-->>API: announcements (possibly empty)
+            else filings cache miss
+                API->>EDGAR: GET document HTML
+                EDGAR-->>API: HTML
+                API->>API: extract and classify matches
+                API->>Filings: upsert ticker, cik, announcements
+            end
+        end
+    end
+
+    API->>API: dedupe and build response
+    API-->>Browser: BuybackResponse JSON
+```
+
+**When Mongo is used vs skipped**
+
+| Step | Uses Mongo? | Uses EDGAR? |
+|------|-------------|-------------|
+| Resolve ticker → CIK | Yes (`tickers`), on hit | Only on ticker cache miss |
+| List filings in lookback | No | Always |
+| List documents in a filing | No | Always (`index.json`) |
+| Scan document text | Yes (`filings`), on hit | Only on document cache miss |
+| Failed document download | No write to `filings` | Retry on next request |
 
 ## Run
 
@@ -151,9 +251,10 @@ pytest
 
 - All narrative documents (primary + exhibits) of each filing are scanned, so
   authorizations announced in an exhibit (common for banks/financials that
-  announce via earnings press releases) are detected. This means more requests
-  to EDGAR per filing; wide `lookback_days` values on prolific filers can be
-  slow.
+  announce via earnings press releases) are detected. The first scan of a ticker
+  can issue many EDGAR requests; later scans reuse the `filings` collection and
+  mostly avoid re-downloading HTML. Wide `lookback_days` on prolific filers can
+  still be slow on the first run.
 - `announcement_date` is the board authorization date when one can be parsed
   from the text; otherwise it falls back to the SEC filing date. `report_date`
   (the filing's period of report, e.g. for an 8-K) is included when available.
